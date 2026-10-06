@@ -49,7 +49,7 @@ team_t team = {
 #define PUT(p, val)  (*(unsigned int *)(p) = (val))
 
 #define GET_SIZE(p) (GET(p) & ~0x7)     /* GET으로 가져온 비트 정보에서 사이즈만(앞에 7비트) 가져옴 */
-#define GET_ALLOC(p) (GET(p) & ~0x1)    /* GET으로 가져온 비트 정보에서 allocated만(마지막 1비트) 가져옴 */
+#define GET_ALLOC(p) (GET(p) & 0x1)    /* GET으로 가져온 비트 정보에서 allocated만(마지막 1비트) 가져옴 */
 
 /* Header를 가리킴 */
 #define HDRP(bp)    ((char *)(bp) - WSIZE)
@@ -97,7 +97,7 @@ static void *extend_heap(size_t words)
     size_t size;
 
     /* words가 홀수이면 +1을 해서 짝수로 만든다. 블록 크기를 8의 배수로 만들기 위함. */
-    size = (words / 2) ? (words + 1) * WSIZE : words * WSIZE;
+    size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
     /* 
      * sbrk는 성공하면 char *(주소값)를 반환하고 실패하면 (Void *)-1를 반환.
      * 따라서 bp의 타입을 long으로 바꿔 -1인지 확인
@@ -246,23 +246,44 @@ static void place(void *bp, size_t asize)
     }
 }
 
-/*
- * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
- */
 void *mm_realloc(void *ptr, size_t size)
 {
-    void *oldptr = ptr;
     void *newptr;
+    size_t oldsize;
     size_t copySize;
-    
-    newptr = mm_malloc(size);
-    if (newptr == NULL)
-      return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+
+    /* ptr == NULL이면 malloc과 동일 */
+    if (ptr == NULL)
+        return mm_malloc(size);
+
+    /* size == 0이면 기존 블록 해제 */
+    if (size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+
+    /* 기존 블록의 전체 크기 */
+    oldsize = GET_SIZE(HDRP(ptr));
+
+    /* 기존 payload 크기 = 전체 블록 크기 - header - footer */
+    copySize = oldsize - 2 * WSIZE;
+
+    /* 새 크기보다 기존 payload가 크면 새 크기만 복사 */
     if (size < copySize)
-      copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
+        copySize = size;
+
+    /* 새로운 블록 할당 */
+    newptr = mm_malloc(size);
+
+    if (newptr == NULL)
+        return NULL;
+
+    /* 기존 데이터 복사 */
+    memcpy(newptr, ptr, copySize);
+
+    /* 기존 블록 해제 */
+    mm_free(ptr);
+
     return newptr;
 }
 
