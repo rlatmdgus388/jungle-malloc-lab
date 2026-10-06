@@ -246,7 +246,6 @@ static void place(void *bp, size_t asize)
     }
 }
 
-
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
