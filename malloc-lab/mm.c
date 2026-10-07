@@ -38,7 +38,11 @@ team_t team = {
 /* single word (4) or double word (8) alignment */
 #define WSIZE 4     /* bytes */
 #define DSIZE 8     /* bytes */
+/* free block이 부족하면 heap을 얼마나 확장할지 */
 #define CHUNKSIZE (1<<12)  /* 2^12 = 4096, 1kb = 1024 bytes -> 4kb */
+
+/* 분리 가용 리스트 개수 */
+#define LIST_NUM 10
 
 #define MAX(x, y) ((x) > (y)? (x): (y))
 
@@ -60,114 +64,210 @@ team_t team = {
 #define NEXT_BLKP(bp)   ((char *)(bp) + GET_SIZE(((char *)(bp) - WSIZE)))    /* bp - WSIZE = 현재 블록의 Header. 따라서 GET_SIZE(bp - WSIZE)=블록의 전체 크기 */   
 /* 이전 블록의 bp를 가리킴 */
 #define PREV_BLKP(bp)   ((char *)(bp) - GET_SIZE(((char *)(bp) - DSIZE)))   /* 이전 블록의 footer(bp - DSIZE)로 가 footer에서 이전 블록의 size를 가져와서 뺌 */
+#define GET_PTR(p)       (*(void **)(p))
+#define PUT_PTR(p, val)  (*(void **)(p) = (val))
+
+#define SUCC(bp) (*(void **)((char *)(bp)))
 
 
 static char *heap_listp;
+static void *seg_free_lists[LIST_NUM];
 /* 헬퍼 함수 프로토타입 선언 (Function Prototypes) */
 static void *extend_heap(size_t words);
 static void *coalesce(void *bp);
 static void *find_fit(size_t asize);
 static void place(void *bp, size_t asize);
+static void insert_free_block(void *bp);
+int get_list_index(size_t size);
 
 /* 
  * mm_init - initialize the malloc package.
  */
 int mm_init(void)
 {
-    /* 초기 블록 세팅 설정 (16비트) */
-    if ((heap_listp = mem_sbrk(4*WSIZE)) == (void *)-1)  /* (void *)-1: 포인터 값이 -1. mem_sbrk는 void *를 반환하는 함수이기 떄문 */
-        return -1;
-    PUT(heap_listp, 0);                             /* Alignment padding */     /* 0 */
-    PUT(heap_listp + (1*WSIZE), PACK(DSIZE, 1));    /* Prologue header */       /* 8/1 */
-    PUT(heap_listp + (2*WSIZE), PACK(DSIZE, 1));    /* Prologue footer */       /* 8/1 */
-    PUT(heap_listp + (3*WSIZE), PACK(0, 1));        /* Epilogue header */       /* 0/1 */
-    heap_listp += (2*WSIZE);    /* prologue의 footer를 가리킴 */
+    void *bp;
 
-    if (extend_heap(CHUNKSIZE/WSIZE) == NULL)
+    if ((heap_listp = mem_sbrk(4 * WSIZE)) == (void *)-1)
         return -1;
+
+    PUT(heap_listp, 0);
+    PUT(heap_listp + (1 * WSIZE), PACK(DSIZE, 1));
+    PUT(heap_listp + (2 * WSIZE), PACK(DSIZE, 1));
+    PUT(heap_listp + (3 * WSIZE), PACK(0, 1));
+
+    heap_listp += (2 * WSIZE);
+
+    for (int i = 0; i < LIST_NUM; i++)
+        seg_free_lists[i] = NULL;
+
+    if ((bp = extend_heap(CHUNKSIZE / WSIZE)) == NULL)
+        return -1;
+
     return 0;
 }
 
 /* 
- * 힙데 사용할 공간이 부족할 떄 힙에 새로운 free block을 하나 추가해서 힙의 크기를 늘리는 함수
+ * 분리 가용 리스트-분리맞춤
+ * header, footer 필요
+ * free list 필요
+ *  free list는 크기 클래스별로 나눠져있음.
+ *  free하거나 split을 해서 생긴 free block을 해당 크기 클래스의 free list의 맨 앞에 넣는 LIFO 방식.
+ * 
+*/
+
+static void insert_free_block(void *bp)
+{
+    int index = get_list_index(GET_SIZE(HDRP(bp)));
+
+    SUCC(bp) = seg_free_lists[index];
+    seg_free_lists[index] = bp;
+}
+
+
+/* size class 결정 */
+int get_list_index(size_t size)
+{
+    if (size <= 31)     return 0;
+    if (size <= 63)     return 1;
+    if (size <= 127)    return 2;
+    if (size <= 255)    return 3;
+    if (size <= 511)    return 4;
+    if (size <= 1023)   return 5;
+    if (size <= 2047)   return 6;
+    if (size <= 4095)   return 7;
+    if (size <= 8191)   return 8;
+    else                return 9;
+}
+
+
+/* 
+ * heap에 새로운 공간을 확보해서 free block을 만드는 함수
 */
 static void *extend_heap(size_t words)
 {
     char *bp;
     size_t size;
 
-    /* words가 홀수이면 +1을 해서 짝수로 만든다. 블록 크기를 8의 배수로 만들기 위함. */
-    size = (words % 2) ? (words + 1) * WSIZE : words * WSIZE;
-    /* 
-     * sbrk는 성공하면 char *(주소값)를 반환하고 실패하면 (Void *)-1를 반환.
-     * 따라서 bp의 타입을 long으로 바꿔 -1인지 확인
-     */
+    size = (words % 2)
+        ? (words + 1) * WSIZE
+        : words * WSIZE;
+
     if ((long)(bp = mem_sbrk(size)) == -1)
         return NULL;
-    
-    PUT(HDRP(bp), PACK(size, 0));           /* Free block header */    /* size | free */
-    PUT(FTRP(bp), PACK(size, 0));           /* Free block footer */    /* size | free */ 
-    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));   /* New epilouge header */  /* 다음 블록의 header = 이전 블록의 footer의 끝 = epilogue 시작점 */
 
-    return coalesce(bp);
+    PUT(HDRP(bp), PACK(size, 0));
+    PUT(FTRP(bp), PACK(size, 0));
+    PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1));
+
+    bp = coalesce(bp);
+
+    insert_free_block(bp);
+
+    return bp;
 }
+
+static void remove_free_block(void *bp)
+{
+    int index = get_list_index(GET_SIZE(HDRP(bp)));
+
+    void *current = seg_free_lists[index];
+    void *prev = NULL;
+
+    while (current != NULL)
+    {
+        if (current == bp)
+        {
+            if (prev == NULL)
+            {
+                // bp가 리스트의 첫 번째 노드
+                seg_free_lists[index] = SUCC(current);
+            }
+            else
+            {
+                // 이전 노드가 bp를 건너뛰도록 연결
+                SUCC(prev) = SUCC(current);
+            }
+
+            SUCC(current) = NULL;
+            return;
+        }
+
+        prev = current;
+        current = SUCC(current);
+    }
+}
+
 
 void mm_free(void *bp)
 {
-    /* header로부터 블록 사이즈를 가져옴 */
     size_t size = GET_SIZE(HDRP(bp));
 
-    /* header의 allocated를 0(free)로 put */
     PUT(HDRP(bp), PACK(size, 0));
-    /* footer의 allocated를 0(free)로 put */
     PUT(FTRP(bp), PACK(size, 0));
-    coalesce(bp);
+
+    bp = coalesce(bp);
+
+    insert_free_block(bp);
 }
 
 /* 현재 노드가 free일 때 앞 뒤 블록의 alloc를 확인해 free인 블록과 결합하는 함수 */
 /* 블록이 결합되는 경우 겹쳐지는 기존 footer와 header에는 합쳐진 블록의 playload로 합쳐짐. 다만 들어있던 데이터는 그대로. */
 static void *coalesce(void *bp)
 {
-    /* 이전 블록의 allocated */
-    size_t prev_alloc = GET_ALLOC(FTRP(PREV_BLKP(bp)));
-    /* 다음 블록의 allocated */
-    size_t next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-    /* 블록의 크기 */
-    size_t size = GET_SIZE(HDRP(bp));
+    size_t prev_alloc =
+        GET_ALLOC(FTRP(PREV_BLKP(bp)));
 
-    /* Case 1: 이전 블록, 다음 블록 둘다 alloc=1인 경우. 못합침 */
-    if (prev_alloc && next_alloc) {
+    size_t next_alloc =
+        GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+
+    size_t size =
+        GET_SIZE(HDRP(bp));
+
+    /* Case 1 */
+    if (prev_alloc && next_alloc)
+    {
         return bp;
     }
 
-    /* Case 2: 이전 블록: alloc=1, 다음 블록: alloc=0 */
-    else if (prev_alloc && !next_alloc) {
-        /* 다음 블록의 헤더로 블록 사이즈를 가져와 현재 블록 사이즈에 더함 */
+    /* Case 2: 다음 블록과 합침 */
+    else if (prev_alloc && !next_alloc)
+    {
+        remove_free_block(NEXT_BLKP(bp));
+
         size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        /* 변한 사이즈 header, footer에 put */
+
         PUT(HDRP(bp), PACK(size, 0));
         PUT(FTRP(bp), PACK(size, 0));
     }
 
-    /* Case 3: 이전 블록: alloc=0, 다음 블록: alloc=1 */
-    else if (!prev_alloc && next_alloc) {
-        /* 이전 블록의 헤더로 블록 사이즈를 가져와 현재 블록 사이즈에 더함 */
+    /* Case 3: 이전 블록과 합침 */
+    else if (!prev_alloc && next_alloc)
+    {
+        remove_free_block(PREV_BLKP(bp));
+
         size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+
         PUT(FTRP(bp), PACK(size, 0));
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
-        /* bp를 이전 블록의 bp로 변경 */
+
         bp = PREV_BLKP(bp);
     }
 
-    /* Case4: 이전 블록: alloc=0, 다음 블록: alloc=0 */
-    else {
-        /* 이전 블록, 다음 블록 사이즈를 현재 블록 사이즈에 + */
-        size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(FTRP(NEXT_BLKP(bp)));
+    /* Case 4: 이전 + 다음 둘 다 합침 */
+    else
+    {
+        remove_free_block(PREV_BLKP(bp));
+        remove_free_block(NEXT_BLKP(bp));
+
+        size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+
         PUT(HDRP(PREV_BLKP(bp)), PACK(size, 0));
         PUT(FTRP(NEXT_BLKP(bp)), PACK(size, 0));
-        /* bp를 이전 블록의 bp로 변경 */
+
         bp = PREV_BLKP(bp);
     }
+
     return bp;
 }
 
@@ -186,34 +286,43 @@ void *mm_malloc(size_t size)
     if (size == 0)
         return NULL;
 
-    /* 할당할 사이즈 <= 8일 경우, 최소 단위 블록 ([4, 8, 4])으로 만들어줌 */
     if (size <= DSIZE)
-        asize = 2*DSIZE;
-    else    
-        /* size + (DSIZE) = playload + header. DSIZE - 1을 더하고 나누고 곱하는건 가장 가까운 8의 배수로 만들기 위함 */
-        asize = DSIZE * ((size + (DSIZE) + (DSIZE - 1)) / DSIZE);
+        asize = 2 * DSIZE;
+    else
+        asize = DSIZE *
+                ((size + DSIZE + (DSIZE - 1)) / DSIZE);
 
-    if ((bp = find_fit(asize)) != NULL) {
+    if ((bp = find_fit(asize)) != NULL)
+    {
         place(bp, asize);
         return bp;
     }
 
-    /* extend_hip을 할 때 asize가 CHUNKSIZE(4096)보다 작으면 4096크기만큼 확장을 함. 확장할 크기가 너무 작으면 sbrk를 자주 호출해야하기 때문 */
     extendsize = MAX(asize, CHUNKSIZE);
-    if ((bp = extend_heap(extendsize/WSIZE)) == NULL)
+
+    if ((bp = extend_heap(extendsize / WSIZE)) == NULL)
         return NULL;
+
     place(bp, asize);
+
     return bp;
 }
 
-/* first-fit */
+/* segregated-fit */
 static void *find_fit(size_t asize)
 {
-    void *bp;
+    int index = get_list_index(asize);
 
-    for (bp = heap_listp; GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)) {     /* 현재 블록의 크기가 0보다 큰지 순회하며 확인. epilouge를 만나면 종료(0/1) */
-        if (!GET_ALLOC(HDRP(bp)) && (asize <= GET_SIZE(HDRP(bp)))) {        /* alloc=0이고 asize <= 블록크기인 블록을 찾으면 bp 리턴 */
-            return bp;
+    for (int i = index; i < LIST_NUM; i++)
+    {
+        void *bp = seg_free_lists[i];
+
+        while (bp != NULL)
+        {
+            if (GET_SIZE(HDRP(bp)) >= asize)
+                return bp;
+
+            bp = SUCC(bp);
         }
     }
 
@@ -223,24 +332,29 @@ static void *find_fit(size_t asize)
 /* 블록을 할당하고, 블록을 통째로 사용하지 쪼개서 사용할지 판단 */
 /* bp = 할당 대상으로 선택된 블록의 playload 시작 주소, asize = 그 free block에 할당할 전체 블록 크기 */
 static void place(void *bp, size_t asize)
-{   
-    /* 할당 대상(발견한)블록의 크기 */
+{
     size_t csize = GET_SIZE(HDRP(bp));
 
-    /* 할당하고 남는 공간 >= 16(최소 블록 크기)
-     * O -> 쪼개기 가능
-     * X -> 쪼개기 불가능
-     */
-    if ((csize - asize) >= (2 * DSIZE)) {
+    remove_free_block(bp);
+
+    if ((csize - asize) >= (2 * DSIZE))
+    {
+        /* 앞쪽 블록 할당 */
         PUT(HDRP(bp), PACK(asize, 1));
         PUT(FTRP(bp), PACK(asize, 1));
 
+        /* 남은 블록 */
         bp = NEXT_BLKP(bp);
-        /* 남는 공간 쪼개기 */
+
         PUT(HDRP(bp), PACK(csize - asize, 0));
         PUT(FTRP(bp), PACK(csize - asize, 0));
+
+        /* 남은 free block을 적절한 리스트에 삽입 */
+        insert_free_block(bp);
     }
-    else {
+    else
+    {
+        /* 통째로 할당 */
         PUT(HDRP(bp), PACK(csize, 1));
         PUT(FTRP(bp), PACK(csize, 1));
     }
